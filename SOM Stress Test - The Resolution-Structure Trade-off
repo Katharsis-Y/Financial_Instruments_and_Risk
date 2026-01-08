@@ -1,0 +1,188 @@
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from minisom import MiniSom
+from sklearn.preprocessing import MinMaxScaler
+from matplotlib.gridspec import GridSpec
+import warnings
+
+# ---------------------------------------------------------
+# [Protocol] Configuration: Visual Stability
+# ---------------------------------------------------------
+np.random.seed(42)
+warnings.filterwarnings('ignore')
+
+plt.style.use('seaborn-v0_8-whitegrid')
+COLORS = {
+    'qe': '#004C99',      # Institutional Blue
+    'te': '#CC0000',      # Risk Red
+    'optimal': '#009900', # Success Green
+    'text': '#333333'
+}
+
+plt.rcParams.update({
+    'font.family': 'sans-serif',
+    'font.sans-serif': ['Arial', 'DejaVu Sans'],
+    'font.size': 10,
+    'axes.labelsize': 11,
+    'axes.titlesize': 12,
+    'figure.titlesize': 14
+})
+
+class InstitutionalSOM:
+    def __init__(self, start_date='2020-01-01', end_date='2023-12-31'):
+        self.start = start_date
+        self.end = end_date
+        self.scaled_data = None
+        self.tickers = [
+            'XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'XLP', 
+            'XLU', 'XLI', 'XLB', 'XLRE', 'XLC'
+        ]
+
+    def fetch_data(self):
+        print(f"[*] Pipeline Initiated: {self.start} -> {self.end}")
+        try:
+            raw = yf.download(self.tickers, start=self.start, end=self.end, progress=False, auto_adjust=False)
+            if raw.empty: raise ValueError("Empty Data.")
+            
+            if 'Adj Close' in raw.columns: df = raw['Adj Close']
+            elif 'Close' in raw.columns: df = raw['Close']
+            else: df = raw.iloc[:, :len(self.tickers)]
+            
+            rets = np.log(df / df.shift(1)).dropna()
+            features = rets.rolling(window=20).std().dropna()
+            
+            self.scaler = MinMaxScaler()
+            self.scaled_data = self.scaler.fit_transform(features.values)
+            print(f"[+] Data Pipeline Success. N={self.scaled_data.shape[0]}")
+            
+        except Exception as e:
+            print(f"[!] Pipeline Critical Failure: {e}")
+            self.scaled_data = None
+
+    def _calc_te(self, som, data):
+        size = len(data)
+        err_count = 0
+        w = som.get_weights()
+        rows, cols = w.shape[0], w.shape[1]
+        flat_w = w.reshape(-1, w.shape[2]) 
+        
+        for x in data:
+            dists = np.linalg.norm(flat_w - x, axis=1)
+            idx_sorted = np.argsort(dists)[:2]
+            pos1 = np.unravel_index(idx_sorted[0], (rows, cols))
+            pos2 = np.unravel_index(idx_sorted[1], (rows, cols))
+            if abs(pos1[0] - pos2[0]) > 1 or abs(pos1[1] - pos2[1]) > 1:
+                err_count += 1
+        return err_count / size
+
+    def run_stress_test(self):
+        grids = [3, 4, 5, 6, 8, 10, 12, 15]
+        stats = []
+        print(f"[*] Running Topology Stress Test...")
+        for n in grids:
+            som = MiniSom(n, n, self.scaled_data.shape[1], sigma=1.0, learning_rate=0.5, random_seed=42)
+            som.pca_weights_init(self.scaled_data)
+            som.train_random(self.scaled_data, 3000, verbose=False)
+            qe = som.quantization_error(self.scaled_data)
+            te = self._calc_te(som, self.scaled_data)
+            stats.append({'Grid': f"{n}x{n}", 'Neurons': n*n, 'QE': qe, 'TE': te})
+            print(f"    -> {n}x{n} | QE: {qe:.4f} | TE: {te:.4f}")
+        return pd.DataFrame(stats)
+
+    def generate_report(self, df):
+        """
+        Visualization v8.0: The "Four Corners" Layout Strategy
+        """
+        fig = plt.figure(figsize=(16, 7))
+        gs = GridSpec(1, 2, width_ratios=[1, 1])
+        
+        # Strategy: Strict TE Filter
+        valid_models = df[df['TE'] <= 0.06]
+        if not valid_models.empty:
+            best_idx = valid_models['QE'].idxmin()
+        else:
+            best_idx = df['TE'].idxmin()
+        best_row = df.loc[best_idx]
+
+        # --- LEFT PANEL: Curves ---
+        ax1 = fig.add_subplot(gs[0])
+        l1 = ax1.plot(df['Neurons'], df['QE'], marker='o', color=COLORS['qe'], label='Resolution (QE)', linewidth=2)
+        ax1.set_xlabel('Model Complexity (Number of Neurons)')
+        ax1.set_ylabel('Quantization Error (QE)', color=COLORS['qe'], fontweight='bold')
+        ax1.tick_params(axis='y', labelcolor=COLORS['qe'])
+        ax1.grid(True, axis='x', linestyle='--')
+
+        ax2 = ax1.twinx()
+        l2 = ax2.plot(df['Neurons'], df['TE'], marker='s', color=COLORS['te'], label='Structure Loss (TE)', linewidth=2, linestyle='--')
+        ax2.set_ylabel('Topographic Error (TE)', color=COLORS['te'], fontweight='bold')
+        ax2.tick_params(axis='y', labelcolor=COLORS['te'])
+        ax2.grid(False)
+
+        # Fix: Move "Winner" text to the VERY TOP of the plot to avoid x-axis overlap
+        ax1.axvline(best_row['Neurons'], color=COLORS['optimal'], linestyle=':', linewidth=2)
+        ax1.text(best_row['Neurons'] + 5, df['QE'].max(), 
+                 f"Winner: {best_row['Grid']}", color=COLORS['optimal'], 
+                 ha='left', va='top', fontweight='bold', backgroundcolor='white')
+        
+        lns = l1 + l2
+        labs = [l.get_label() for l in lns]
+        ax1.legend(lns, labs, loc='center right', frameon=True) # Legend moved out of the way
+        ax1.set_title('Metric Analysis: Resolution vs. Structure', fontweight='bold')
+
+        # --- RIGHT PANEL: Pareto Matrix ---
+        ax3 = fig.add_subplot(gs[1])
+        
+        # 1. Background Zones
+        ax3.axvspan(0, 0.06, color='green', alpha=0.05)
+        ax3.axvspan(0.06, df['TE'].max()*1.1, color='red', alpha=0.05)
+
+        # 2. Zone Labels (Fixed to Axes Coordinates - The Corners Strategy)
+        # This locks the text to the frame corners, ensuring they NEVER overlap with data points
+        ax3.text(0.02, 0.02, 'SAFE ZONE\n(Valid Map)', transform=ax3.transAxes, 
+                 color='green', ha='left', va='bottom', fontweight='bold', fontsize=10, 
+                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+        
+        ax3.text(0.98, 0.98, 'DANGER ZONE\n(Twisted Map)', transform=ax3.transAxes, 
+                 color='red', ha='right', va='top', fontweight='bold', fontsize=10,
+                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='none'))
+
+        # 3. Scatter Points
+        ax3.scatter(df['TE'], df['QE'], s=100, c=COLORS['qe'], edgecolors='black', zorder=3)
+        
+        # 4. Winner Highlight & Annotation
+        ax3.scatter(best_row['TE'], best_row['QE'], s=300, facecolors='none', edgecolors=COLORS['optimal'], linewidth=3, zorder=4)
+        
+        # Smart Annotation: Force text to the RIGHT of the point
+        ax3.annotate(f" RECOMMENDATION: {best_row['Grid']}", 
+                     xy=(best_row['TE'], best_row['QE']), 
+                     xytext=(best_row['TE'] + 0.04, best_row['QE']), # Push text further right
+                     arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=8),
+                     fontsize=10, fontweight='bold', ha='left', va='center',
+                     bbox=dict(facecolor='white', alpha=0.7, edgecolor='none'))
+
+        # 5. Data Labels (Skip the winner to avoid double labeling)
+        for i, row in df.iterrows():
+            if row['Grid'] == best_row['Grid']: continue
+            ax3.text(row['TE'], row['QE'] - 0.003, row['Grid'], fontsize=8, ha='center', alpha=0.6)
+
+        ax3.set_xlabel('Structure Loss (TE) -> Lower is Better')
+        ax3.set_ylabel('Resolution Loss (QE) -> Lower is Better')
+        ax3.set_title('Decision Matrix: Pareto Frontier', fontweight='bold')
+        
+        # Ensure x-axis shows the safe zone even if data is far
+        ax3.set_xlim(left=-0.01) 
+        
+        plt.tight_layout()
+        plt.savefig('som_final_report_v8.png', dpi=300)
+        print(f"[System] Publication-Grade Report Generated: 'som_final_report_v8.png'")
+        plt.show()
+
+if __name__ == "__main__":
+    eng = InstitutionalSOM()
+    eng.fetch_data()
+    if eng.scaled_data is not None:
+        res = eng.run_stress_test()
+        eng.generate_report(res)

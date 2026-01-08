@@ -1,0 +1,133 @@
+import yfinance as yf
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.manifold import TSNE
+from scipy.spatial import ConvexHull
+
+# --- PROTOCOL: PUBLICATION STANDARD (ENHANCED PALETTE) ---
+# Expanded Universe: ~23 Assets covering distinct risk factors
+assets = {
+    'Tech/AI': ['AAPL', 'MSFT', 'NVDA', 'AMD', 'GOOG', 'META', 'TSM', 'AVGO'],
+    'Energy': ['XOM', 'CVX', 'OXY', 'SHEL', 'COP'],
+    'Financials': ['JPM', 'BAC', 'GS', 'V', 'MA'],
+    'Defensive/Safe': ['SHV', 'BIL', 'TLT', 'IEF', 'GLD'] # Added Gold & Long Bonds
+}
+
+# Distinct Professional Colors
+colors = {
+    'Tech/AI': '#2980b9',       # Strong Blue
+    'Energy': '#c0392b',        # Deep Red
+    'Financials': '#8e44ad',    # Purple
+    'Defensive/Safe': '#27ae60' # Green
+}
+
+markers = {
+    'Tech/AI': 'o', 
+    'Energy': '^', 
+    'Financials': 'D',
+    'Defensive/Safe': 's'
+}
+
+tickers = [t for sector in assets.values() for t in sector]
+
+# --- 1. DATA INGESTION ---
+print(f"--> Fetching data for {len(tickers)} assets...")
+try:
+    # Attempt with auto_adjust
+    data = yf.download(tickers, period="1y", interval="1d", auto_adjust=True)['Close']
+except:
+    # Fallback
+    data = yf.download(tickers, period="1y", interval="1d")['Adj Close']
+
+# Validation: Drop assets that failed to download or have NaN
+data = data.dropna(axis=1, how='any')
+valid_tickers = data.columns.tolist()
+
+# Calculate Correlation-based Distance (More robust for Finance than Euclidean)
+# But t-SNE usually takes raw features. Let's use Returns.
+returns = data.pct_change().dropna()
+X = returns.T.values
+
+# --- 2. t-SNE EXECUTION ---
+# Perplexity Tuning: For N=23, perplexity should be between 5 and 10.
+# Rule of thumb: Perplexity ~ N^(1/2) to N/3. Let's use 6 for structure balance.
+tsne = TSNE(
+    n_components=2, 
+    perplexity=6,  # Optimized for ~20 points
+    random_state=42, 
+    init='pca', 
+    learning_rate='auto',
+    method='exact' # 'exact' is better for small datasets (< few thousand)
+)
+X_embedded = tsne.fit_transform(X)
+
+# --- 3. PLOTTING LOGIC (With Robust Hulls) ---
+plt.style.use('default')
+fig, ax = plt.subplots(figsize=(14, 10), facecolor='white')
+ax.set_facecolor('white')
+# Using a lighter grid for cleaner look
+ax.grid(True, color='#f0f0f0', linestyle='--', alpha=0.8) 
+
+def get_coords_and_labels(ticker_subset):
+    # Match sector list with valid downloaded tickers
+    valid_subset = [t for t in ticker_subset if t in valid_tickers]
+    idxs = [valid_tickers.index(t) for t in valid_subset]
+    return X_embedded[idxs], valid_subset
+
+# Iterate and Plot
+for sector, ticker_list in assets.items():
+    coords, subset_labels = get_coords_and_labels(ticker_list)
+    
+    if len(coords) == 0: continue
+
+    # A. Scatter Plot
+    ax.scatter(coords[:, 0], coords[:, 1], 
+               c=colors[sector], label=sector, 
+               s=180, alpha=0.9, edgecolors='white', linewidth=1.5, marker=markers[sector], zorder=10)
+    
+    # B. Robust Convex Hull (The "Fix")
+    # Now we have >2 points per sector, Hull will work.
+    if len(coords) > 2:
+        try:
+            hull = ConvexHull(coords)
+            # Draw perimeter
+            for simplex in hull.simplices:
+                ax.plot(coords[simplex, 0], coords[simplex, 1], color=colors[sector], linestyle='--', alpha=0.4, zorder=5)
+            # Fill area
+            ax.fill(coords[hull.vertices,0], coords[hull.vertices,1], color=colors[sector], alpha=0.1, zorder=1)
+        except Exception as e:
+            print(f"Hull failed for {sector}: {e}")
+    
+    # C. Annotation (Anti-collision logic is hard in pure mpl, standard annotate here)
+    for i, txt in enumerate(subset_labels):
+        ax.annotate(txt, (coords[i, 0], coords[i, 1]), 
+                    xytext=(8, 8), textcoords='offset points', 
+                    fontsize=9, color='#34495e', weight='bold', family='sans-serif', zorder=15)
+
+# --- 4. FINAL POLISH ---
+ax.set_title("Market Regime & Asset Class Clustering (t-SNE Map)", 
+             fontsize=18, weight='bold', pad=25, loc='left', color='#2c3e50')
+
+# Removing axis ticks as requested for pure topological view
+ax.set_xticks([])
+ax.set_yticks([])
+ax.set_xlabel("Latent Component 1", fontsize=10, color='#95a5a6')
+ax.set_ylabel("Latent Component 2", fontsize=10, color='#95a5a6')
+
+# Interpretation Box
+desc = (
+    "INSIGHTS:\n"
+    "1. Defensive Separation: Gold (GLD) & Treasuries (TLT) form a distinct 'Safe Haven' island.\n"
+    "2. Interest Rate Sensitivity: Financials (JPM) often bridge the gap between Value and Growth.\n"
+    "3. Intra-Sector Structure: Note the sub-clustering within Tech (Semis vs. Software).\n"
+    "4. 'Hull' Area: Represents the diversification breadth of that sector."
+)
+props = dict(boxstyle='round,pad=1', facecolor='#f8f9fa', alpha=1.0, edgecolor='#ecf0f1')
+ax.text(0.02, 0.02, desc, transform=ax.transAxes, fontsize=10,
+        verticalalignment='bottom', bbox=props, fontname='monospace', color='#2c3e50')
+
+ax.legend(loc='upper right', frameon=True, framealpha=0.95, edgecolor='#d3d3d3', fontsize=11, title="Asset Classes")
+
+plt.tight_layout()
+plt.show()
